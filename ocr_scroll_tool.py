@@ -6,7 +6,7 @@ A script that lets you:
   1. Use Ctrl+Shift+1 to mark the top-left corner of the region.
   2. Use Ctrl+Shift+2 to mark the bottom-right corner.
   3. After both corners are marked, use:
-       • Ctrl+Shift+C → capture that region, run OCR, append text, send Page Down.
+       • Ctrl+Shift+C → capture that region, run OCR, append text.
        • Ctrl+Shift+Q → stop and save all collected text.
 
 Usage:
@@ -24,6 +24,8 @@ from PIL import ImageGrab
 from pynput import keyboard, mouse
 import os
 from datetime import datetime
+import threading
+from PIL import ImageOps
 
 # Global state
 top_left = None       # (x, y) tuple for top-left corner
@@ -31,6 +33,10 @@ bottom_right = None   # (x, y) tuple for bottom-right corner
 region_ready = False  # True once both corners are marked
 ocr_buffer = []       # Stores extracted text chunks
 tesseract_cmd = None  # If Tesseract is not on PATH, set full path here (e.g. r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+
+capturing = False       # Indicates if automatic capture is ongoing
+capture_thread = None   # Holds reference to the capture thread
+prev_capture = None     # Holds the last captured image for change detection
 
 mouse_controller = mouse.Controller()
 
@@ -54,43 +60,60 @@ def on_mark_bottomright():
         return
     region_ready = True
     print(f"[REGION] Bottom-right corner set to {bottom_right}.")
-    print("Region marked. Now press Ctrl+Shift+C to capture+scroll, or Ctrl+Shift+Q to stop and save.")
+    print("Region marked. Press Ctrl+Shift+C to capture. After capturing, manually scroll and press Ctrl+Shift+C again for next capture.")
 
 def on_capture():
-    global region_ready, ocr_buffer, tesseract_cmd
+    global region_ready, capturing, capture_thread, prev_capture
     if not region_ready:
         print("[ERROR] Region not ready. Mark corners with Ctrl+Shift+1 and Ctrl+Shift+2.")
         return
-    x1, y1 = int(top_left[0]), int(top_left[1])
-    x2, y2 = int(bottom_right[0]), int(bottom_right[1])
-    bbox = (x1, y1, x2, y2)
-    # Short delay to allow any scrolling to finish
-    time.sleep(0.1)
-    img = ImageGrab.grab(bbox)
-    if tesseract_cmd:
-        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-    custom_config = r"--psm 6"
-    text = pytesseract.image_to_string(img, config=custom_config)
-    ocr_buffer.append(text)
-    # Send Page Down
-    keyboard.Controller().press(keyboard.Key.page_down)
-    keyboard.Controller().release(keyboard.Key.page_down)
-    print(f"[OCR] Captured chunk #{len(ocr_buffer)}, {len(text)} characters.")
+    if capturing:
+        print("[INFO] Already capturing.")
+        return
+    capturing = True
+    prev_capture = None
+    print("[AUTO] Automatic capture started. Scroll manually. Press Ctrl+Shift+Q to stop and save.")
+    # Define the capture loop
+    def capture_loop():
+        global prev_capture, ocr_buffer, tesseract_cmd, capturing
+        x1, y1 = int(top_left[0]), int(top_left[1])
+        x2, y2 = int(bottom_right[0]), int(bottom_right[1])
+        bbox = (x1, y1, x2, y2)
+        while capturing:
+            img = ImageGrab.grab(bbox)
+            # Compare with previous capture
+            if prev_capture is None or list(img.getdata()) != list(prev_capture.getdata()):
+                gray = ImageOps.grayscale(img)
+                if tesseract_cmd:
+                    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+                custom_config = r"--psm 6"
+                text = pytesseract.image_to_string(gray, config=custom_config)
+                if text.strip() and (not ocr_buffer or text.strip() != ocr_buffer[-1].strip()):
+                    ocr_buffer.append(text)
+                    print(f"[OCR] Captured chunk #{len(ocr_buffer)}, {len(text)} chars.")
+                prev_capture = img
+            time.sleep(0.5)
+    # Start capture thread
+    capture_thread = threading.Thread(target=capture_loop, daemon=True)
+    capture_thread.start()
 
 def on_stop():
-    # Stop the hotkey listener
+    global capturing, capture_thread
+    # Stop listening for hotkeys
     listener.stop()
-    # If no text was captured, exit
+    # Signal the capture loop to stop
+    capturing = False
+    # Wait for the capture thread to finish
+    if capture_thread:
+        capture_thread.join()
     if not ocr_buffer:
         print("[STOP] No text captured. Exiting.")
         sys.exit(0)
-
     # Determine script directory and build a timestamped filename
     script_dir = os.path.dirname(os.path.abspath(__file__))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"ocr_{timestamp}.txt"
     file_path = os.path.join(script_dir, filename)
-
     # Write OCR buffer to the new file
     try:
         with open(file_path, "w", encoding="utf-8") as f:
@@ -113,7 +136,8 @@ if __name__ == "__main__":
     print("  1) Hover mouse over top-left corner of region, press Ctrl+Shift+1")
     print("  2) Hover mouse over bottom-right corner, press Ctrl+Shift+2")
     print("  After marking region, use:")
-    print("    • Ctrl+Shift+C → capture+scroll")
+    print("    • Ctrl+Shift+C → capture current region")
+    print("      (then manually scroll and press Ctrl+Shift+C again for next capture)")
     print("    • Ctrl+Shift+Q → stop and save")
     print("")
     listener = keyboard.GlobalHotKeys(hotkey_actions)
